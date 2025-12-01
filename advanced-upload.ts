@@ -36,6 +36,7 @@ interface UploadState {
     uploadedParts: Array<{ PartNumber: number; ETag: string }>;
     nextPartNumber: number;
     isPaused: boolean;
+    isAborted: boolean;
 }
 
 /**
@@ -172,16 +173,62 @@ class UploadManager {
 
             try {
                 // Upload parts
-                while (state.nextPartNumber <= totalParts && !state.isPaused) {
+                while (!state.isPaused && !state.isAborted) {
+                    // Find next missing part
+                    const uploadedPartNumbers = new Set(state.uploadedParts.map(p => p.PartNumber));
+                    let nextPartToUpload = -1;
+                    
+                    for (let i = 1; i <= totalParts; i++) {
+                        if (!uploadedPartNumbers.has(i)) {
+                            // Check if this part is already being uploaded
+                            // Note: In a real implementation we'd track active uploads more precisely
+                            // For this simple implementation, we rely on the loop and state.nextPartNumber
+                            // But since we are changing logic to find gaps, we need a way to track what's in progress
+                            // Let's simplify: we will use a simple counter for now, but strictly check gaps
+                            // actually, the previous logic was just incrementing nextPartNumber.
+                            // To handle gaps properly, we should maintain a set of "pending" parts.
+                            // However, to keep it simple but robust:
+                            // We will just iterate from 1 to totalParts and find the first one NOT in uploadedParts AND NOT in progress.
+                            // But "in progress" is hard to track without extra state.
+                            // Let's stick to the "nextPartNumber" approach but ensure we skip already uploaded ones.
+                            
+                            if (i >= state.nextPartNumber) {
+                                nextPartToUpload = i;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (nextPartToUpload === -1) {
+                        // No more parts to upload
+                        break;
+                    }
+
+                    // Update nextPartNumber to avoid re-checking
+                    state.nextPartNumber = nextPartToUpload + 1;
+
                     // Upload parts concurrently
                     const uploadPromises: Promise<void>[] = [];
+                    
+                    // We found one part, let's try to find more for concurrency
+                    const partsToUpload = [nextPartToUpload];
+                    let tempNext = nextPartToUpload + 1;
+                    while (partsToUpload.length < MAX_CONCURRENT_UPLOADS && tempNext <= totalParts) {
+                         if (!uploadedPartNumbers.has(tempNext)) {
+                             partsToUpload.push(tempNext);
+                         }
+                         tempNext++;
+                    }
+                    
+                    // Update state.nextPartNumber to the highest scheduled part + 1
+                    // This is an approximation, but works for sequential filling of gaps
+                    if (partsToUpload.length > 0) {
+                        state.nextPartNumber = partsToUpload[partsToUpload.length - 1] + 1;
+                    }
 
-                    for (
-                        let i = 0;
-                        i < MAX_CONCURRENT_UPLOADS && state.nextPartNumber <= totalParts;
-                        i++
-                    ) {
-                        const partNumber = state.nextPartNumber++;
+                    for (const partNumber of partsToUpload) {
+                        if (state.isPaused || state.isAborted) break;
+                        
                         const promise = this.uploadPart(
                             file,
                             state,
@@ -193,6 +240,17 @@ class UploadManager {
                     }
 
                     await Promise.all(uploadPromises);
+                    
+                    // Check if we are done (all parts uploaded)
+                    if (state.uploadedParts.length === totalParts) {
+                        break;
+                    }
+                }
+
+                // Check if aborted
+                if (state.isAborted) {
+                    // Cleanup is handled in abortUpload
+                    return;
                 }
 
                 // Check if paused
@@ -208,6 +266,11 @@ class UploadManager {
                     });
                     console.log(`⏸️  Upload paused: ${key}`);
                     return;
+                }
+
+                // Double check if all parts are uploaded
+                if (state.uploadedParts.length !== totalParts) {
+                    throw new Error(`Upload incomplete: ${state.uploadedParts.length}/${totalParts} parts uploaded`);
                 }
 
                 // Complete multipart upload
@@ -229,6 +292,10 @@ class UploadManager {
                 file.close();
             }
         } catch (error) {
+            if (state! && state.isAborted) {
+                 console.log(`🛑 Upload aborted (caught in loop): ${key}`);
+                 return;
+            }
             console.error(`❌ Upload failed: ${key}`, error);
             onProgress?.({
                 fileName: filePath,
@@ -270,6 +337,7 @@ class UploadManager {
             uploadedParts: [],
             nextPartNumber: 1,
             isPaused: false,
+            isAborted: false,
         };
     }
 
@@ -306,7 +374,7 @@ class UploadManager {
                 ETag: part.ETag!,
             })) || [];
 
-        const nextPartNumber = uploadedParts.length + 1;
+
 
         return {
             uploadId: finalUploadId,
@@ -315,8 +383,9 @@ class UploadManager {
             filePath,
             fileSize,
             uploadedParts,
-            nextPartNumber,
+            nextPartNumber: 1, // Reset to 1 to scan for gaps
             isPaused: false,
+            isAborted: false,
         };
     }
 
@@ -329,56 +398,68 @@ class UploadManager {
         partNumber: number,
         fileSize: number,
         onProgress?: ProgressCallback,
+        retryCount = 0,
     ): Promise<void> {
+        if (state.isAborted) return;
+
         const offset = (partNumber - 1) * PART_SIZE;
         const partSize = Math.min(PART_SIZE, fileSize - offset);
 
-        // Read part data
-        const buffer = new Uint8Array(partSize);
-        await file.seek(offset, Deno.SeekMode.Start);
-        await file.read(buffer);
+        try {
+            // Read part data
+            const buffer = new Uint8Array(partSize);
+            await file.seek(offset, Deno.SeekMode.Start);
+            await file.read(buffer);
 
-        // Upload part
-        const command = new UploadPartCommand({
-            Bucket: state.bucket,
-            Key: state.key,
-            UploadId: state.uploadId,
-            PartNumber: partNumber,
-            Body: buffer,
-        });
+            // Upload part
+            const command = new UploadPartCommand({
+                Bucket: state.bucket,
+                Key: state.key,
+                UploadId: state.uploadId,
+                PartNumber: partNumber,
+                Body: buffer,
+            });
 
-        const response = await s3Client.send(command);
+            const response = await s3Client.send(command);
 
-        if (!response.ETag) {
-            throw new Error(`Failed to upload part ${partNumber}`);
+            if (!response.ETag) {
+                throw new Error(`Failed to upload part ${partNumber}`);
+            }
+
+            // Store uploaded part info
+            state.uploadedParts.push({
+                PartNumber: partNumber,
+                ETag: response.ETag,
+            });
+
+            // Sort parts by part number
+            state.uploadedParts.sort((a, b) => a.PartNumber - b.PartNumber);
+
+            // Report progress
+            const uploadedBytes = state.uploadedParts.length * PART_SIZE;
+            const totalParts = Math.ceil(fileSize / PART_SIZE);
+
+            onProgress?.({
+                fileName: state.filePath,
+                uploadedBytes: Math.min(uploadedBytes, fileSize),
+                totalBytes: fileSize,
+                percentage: Math.min((uploadedBytes / fileSize) * 100, 100),
+                currentPart: state.uploadedParts.length,
+                totalParts,
+                status: "uploading",
+            });
+
+            console.log(
+                `  📦 Part ${partNumber}/${totalParts} uploaded (${this.formatBytes(partSize)})`,
+            );
+        } catch (error) {
+            if (retryCount < 3 && !state.isAborted) {
+                console.log(`  ⚠️  Retrying part ${partNumber} (Attempt ${retryCount + 1}/3)...`);
+                await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1))); // Exponential backoff
+                return this.uploadPart(file, state, partNumber, fileSize, onProgress, retryCount + 1);
+            }
+            throw error;
         }
-
-        // Store uploaded part info
-        state.uploadedParts.push({
-            PartNumber: partNumber,
-            ETag: response.ETag,
-        });
-
-        // Sort parts by part number
-        state.uploadedParts.sort((a, b) => a.PartNumber - b.PartNumber);
-
-        // Report progress
-        const uploadedBytes = state.uploadedParts.length * PART_SIZE;
-        const totalParts = Math.ceil(fileSize / PART_SIZE);
-
-        onProgress?.({
-            fileName: state.filePath,
-            uploadedBytes: Math.min(uploadedBytes, fileSize),
-            totalBytes: fileSize,
-            percentage: Math.min((uploadedBytes / fileSize) * 100, 100),
-            currentPart: state.uploadedParts.length,
-            totalParts,
-            status: "uploading",
-        });
-
-        console.log(
-            `  📦 Part ${partNumber}/${totalParts} uploaded (${this.formatBytes(partSize)})`,
-        );
     }
 
     /**
@@ -446,6 +527,7 @@ class UploadManager {
         const state = this.uploadStates.get(stateKey);
 
         if (state) {
+            state.isAborted = true;
             const command = new AbortMultipartUploadCommand({
                 Bucket: state.bucket,
                 Key: state.key,
