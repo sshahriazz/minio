@@ -1,0 +1,16 @@
+{
+    "tasks": {
+        "dev": "deno run --allow-net --allow-read --allow-write --allow-env --allow-sys main.ts",
+        "start": "deno run --allow-net --allow-read --allow-write --allow-env --allow-sys main.ts"
+    },
+    "imports": {
+        "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@^3.0.0"
+    },
+    "compilerOptions": {
+        "lib": [
+            "deno.window",
+            "deno.ns"
+        ],
+        "strict": true
+    }
+}

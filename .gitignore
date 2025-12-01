@@ -1,0 +1,21 @@
+# Deno
+.deno/
+deno.lock
+
+# Environment variables
+.env
+.env.local
+
+# Downloaded files (for testing)
+downloaded-*
+
+# Test files
+test-*.txt
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
